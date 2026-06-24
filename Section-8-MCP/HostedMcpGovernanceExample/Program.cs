@@ -1,35 +1,41 @@
 ﻿using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
+using ModelContextProtocol.Client;
 using Ollama;
 using OllamaSharp;
+using OllamaSharp.Models.Chat;
 
 Console.WriteLine("--- Initializing Remote Mentorship Swarm ---");
-
-// 1. Define the Hosted MCP Tool with Governance
-// We connect to the remote SSE endpoint and explicitly demand human approval before execution.
-var mcpHostedTool = new HostedMcpServerTool(
-    serverName: "microsoft_learn",
-    serverAddress: "https://learn.microsoft.com/api/mcp/openai-compatible")
-{
-    // Restrict the agent to only use the search tool
-    AllowedTools = ["microsoft_docs_search"],
-    // GOVERNANCE: Force the agent to pause and ask permission before crossing the network boundary
-    ApprovalMode = HostedMcpServerToolApprovalMode.AlwaysRequire
-};
 
 // 2. Initialize the Agent
 OllamaApiClient ollamaApiClient = new OllamaApiClient(OllamaConfiguration.Endpoint, OllamaConfiguration.Model)
     .WithLongTimeout();
 
+using var client = new ChatClientBuilder(ollamaApiClient)
+    .UseFunctionInvocation()
+    .Build();
+
+using var httpClient = new HttpClient();
+
+var mcpClient = await McpClient.CreateAsync(
+    new HttpClientTransport(new HttpClientTransportOptions() 
+    { 
+        Endpoint = new Uri("https://learn.microsoft.com/api/mcp"),
+        TransportMode = HttpTransportMode.StreamableHttp
+    }, httpClient, ownsHttpClient: true)
+    );
+
+var mcpTools = (await mcpClient.ListToolsAsync().ConfigureAwait(false)).Cast<AIFunction>();
+var approvalRequiredTools = mcpTools.Select(tool => new ApprovalRequiredAIFunction(tool)).ToList();
+
 AIAgent mentorAgent = ollamaApiClient
     .AsAIAgent(
         name: "ArchitectureMentor",
-        instructions: "You answer technical .NET questions. You MUST use the 'microsoft_docs_search' tool from the 'microsoft_learn' server before answering.",
+        instructions: "You answer technical .NET questions. You MUST use the 'microsoft_docs_search' tool from the 'microsoft_learn' server before answering."+
+        "If the approval for a tool call is required, and user denies it, you must not proceed with the tool call and inform the user accordingly and DO NOT provide alternative solutions/information.",
         //instructions: "You are a Senior Architecture Mentor. To provide accurate answers, always start by calling the 'microsoft_docs_search' tool.",
-        tools: [mcpHostedTool]
+        tools: [.. approvalRequiredTools]
     );
-
-Console.WriteLine($"Tools available: {string.Join(", ", mcpHostedTool.AllowedTools)}");
 
 // 3. Begin the Stateful Session
 AgentSession session = await mentorAgent.CreateSessionAsync();
@@ -55,12 +61,12 @@ while (approvalRequests.Count > 0)
 
     // Present the agent's intent to the human manager
     Console.WriteLine("\n[SECURITY AUDIT] The agent is attempting to execute a remote tool.");
-    if (request.ToolCall is McpServerToolCallContent mcpToolCall)
+    if (request.ToolCall is ToolCallContent toolCallContent)
     {
-        Console.WriteLine($"Target Server: {mcpToolCall.ServerName}");
-        Console.WriteLine($"Target Tool:   {mcpToolCall.Name}");
+        Message.ToolCall toolCall = (Message.ToolCall)toolCallContent.RawRepresentation!;
+        Console.WriteLine($"Target Tool:   {(toolCall).Function?.Name}");
 
-        string toolArgs = string.Join(", ", mcpToolCall.Arguments?.Select(x => $"{x.Key}: '{x.Value}'") ?? []);
+        string toolArgs = string.Join(", ", toolCall.Function?.Arguments?.Select(x => $"{x.Key}: '{x.Value}'") ?? []);
         Console.WriteLine($"Arguments:     {toolArgs}");
     }
     else
@@ -79,7 +85,7 @@ while (approvalRequests.Count > 0)
     bool isApproved = key == ConsoleKey.Y;
 
     // Package the human's decision back into a ChatMessage
-    var approvalMessage = new ChatMessage(ChatRole.User, [request.CreateResponse(isApproved)]);
+    var approvalMessage = new ChatMessage(Microsoft.Extensions.AI.ChatRole.User, [request.CreateResponse(isApproved)]);
 
     // Push the human's approval (or denial) back to the agent and resume execution
     Console.WriteLine("\n[System] Resuming agent execution...");
